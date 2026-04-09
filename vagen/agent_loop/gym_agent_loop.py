@@ -51,6 +51,31 @@ def _flatten_text_only_content(msg):
     return new_msg
 
 
+def _sanitize_mm_placeholder_text(text: str) -> str:
+    """Sanitize multimodal placeholders in free-form assistant text.
+
+    Qwen-VL processor may treat strings like `<image>` / `<video>` (and related
+    vision control tokens) as real multimodal placeholders during next-turn
+    tokenization. If model output accidentally contains these strings, it can
+    create more image placeholders than provided images and trigger index errors.
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    replacements = {
+        "<image>": "[image]",
+        "<video>": "[video]",
+        "<img>": "[img]",
+        "<|image_pad|>": "[image_pad]",
+        "<|video_pad|>": "[video_pad]",
+        "<|vision_start|>": "[vision_start]",
+        "<|vision_end|>": "[vision_end]",
+    }
+    for src, dst in replacements.items():
+        s = s.replace(src, dst)
+    return s
+
+
 class AgentState(Enum):
     PENDING = "pending"
     GENERATING = "generating"
@@ -344,7 +369,8 @@ class GymAgentLoop(AgentLoopBase):
             None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
         )
         agent_data.last_assistant_text = assistant_message
-        agent_data.messages.append({"role": "assistant", "content": assistant_message})
+        safe_assistant_message = _sanitize_mm_placeholder_text(assistant_message)
+        agent_data.messages.append({"role": "assistant", "content": safe_assistant_message})
         return AgentState.INTERACTING
 
     async def _handle_env_state(self, agent_data: AgentData, **kwargs) -> AgentState:
