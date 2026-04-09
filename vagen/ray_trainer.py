@@ -815,24 +815,20 @@ class RayPPOTrainer:
         These prompts are generated on driver side and sent to the SAME actor policy
         (current training weights) for rubric proposal generation.
         """
-        prompt_ids = batch.batch["prompts"]
         response_ids = batch.batch["responses"]
         attention_mask = batch.batch["attention_mask"]
-        prompt_len = prompt_ids.shape[-1]
+        prompt_len = batch.batch["prompts"].shape[-1]
         valid_response_lengths = attention_mask[:, prompt_len:].sum(dim=-1)
 
-        prompts = self.tokenizer.batch_decode(prompt_ids.tolist(), skip_special_tokens=True)
         responses = []
         for i in range(len(batch)):
             valid_len = int(valid_response_lengths[i].item())
             responses.append(self.tokenizer.decode(response_ids[i][:valid_len], skip_special_tokens=True))
 
         rubric_prompts: list[str] = []
-        for p, r in zip(prompts, responses, strict=True):
-            clean_context = _strip_multimodal_placeholders(p)
+        for r in responses:
             rubric_prompts.append(
                 f"{RLCER_POLICY_RUBRICATOR_PROMPT}\n\n"
-                f"[Task Context]\n{clean_context}\n\n"
                 f"[Solver Response]\n{r}\n\n"
                 "Return JSON only."
             )
