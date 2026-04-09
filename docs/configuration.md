@@ -1,0 +1,108 @@
+# Configuration
+
+The main config file is [`vagen/configs/vagen_multiturn.yaml`](https://github.com/mll-lab-nu/VAGEN/blob/main/vagen/configs/vagen_multiturn.yaml).
+
+## Trainer
+
+```yaml
+trainer:
+  skip_special_tokens_val: False
+  skip_special_tokens_train: False
+  replace_image_tokens_for_logging: True
+  log_image:
+    enable: True
+    max_pending: 2
+    png_compress_level: 0
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `skip_special_tokens_val` | bool | `False` | Skip special tokens when logging validation outputs |
+| `skip_special_tokens_train` | bool | `False` | Skip special tokens when logging training outputs |
+| `replace_image_tokens_for_logging` | bool | `True` | Replace `<image>` tokens with placeholder for cleaner logs |
+| `log_image.enable` | bool | `True` | Enable image logging to local folder |
+| `log_image.max_pending` | int | `2` | Maximum pending image uploads |
+| `log_image.png_compress_level` | int | `0` | PNG compression level (0=none, 9=max) |
+
+
+## Filter
+
+```yaml
+filter:
+  name: reward_variance
+  filter_kwargs: {}
+  enable: False
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | str | `reward_variance` | Filter name (must be registered via `@register_filter`) |
+| `filter_kwargs` | dict | `{}` | Arguments passed to filter function as `**kwargs` |
+| `enable` | bool | `False` | Enable/disable filtering |
+
+See [Custom Filter](custom-filter.md) for creating your own filters.
+
+### Built-in Filter Options
+
+**`reward_variance`**
+```yaml
+filter:
+  name: reward_variance
+  filter_kwargs:
+    topk: 0.2      # Keep top 20% groups by variance
+    ddof: 0        # Degrees of freedom for variance calculation
+  enable: True
+```
+
+**`reward_variance_top_p`**
+```yaml
+filter:
+  name: reward_variance_top_p
+  filter_kwargs:
+    top_p: 0.9     # Keep groups until 90% cumulative variance
+    ddof: 0
+  enable: True
+```
+
+## RLCER Custom Reward (Optional)
+
+RLCER is enabled via `custom_reward_function` (no trainer-core patch required).
+
+```yaml
+reward_model:
+  reward_manager: batch
+
+custom_reward_function:
+  path: vagen/rlcer/reward_rlcer.py
+  name: compute_score
+  reward_kwargs:
+    alpha: 0.2
+    lambda_cot: 1.0
+    outcome_weight: 1.0
+    enable_dual_role_update: false
+    fallback_to_heuristic: true
+    rubricator:
+      # policy | external | heuristic
+      mode: policy
+      base_url: http://127.0.0.1:8000/v1
+      api_key: EMPTY
+      model: <your-policy-model-name>
+      timeout: 60
+      max_rubrics: 8
+    verifier:
+      # heuristic | external
+      mode: heuristic
+      base_url: http://127.0.0.1:8000/v1
+      api_key: EMPTY
+      model: <optional-verifier-model>
+      timeout: 60
+```
+
+Notes:
+- `rubricator.mode=policy` means rubricator and solver use the same policy-serving endpoint/model.
+- `rubricator.mode=external` switches rubric generation to an external LLM.
+- `verifier.mode=heuristic` uses rule-based judgement; `external` uses an external LLM verifier.
+- `enable_dual_role_update=true` enables joint PPO update by appending rubricator-role trajectories
+  (with role-specific rewards/advantages) into the training batch.
+
+
