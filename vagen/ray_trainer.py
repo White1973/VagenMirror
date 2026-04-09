@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -74,6 +75,37 @@ RLCER_POLICY_RUBRICATOR_PROMPT = (
     '{"rubrics": [{"criterion": str, "points": number}, ...]}. '
     "Use 4-8 binary-evaluable criteria and non-zero points."
 )
+
+
+def _strip_multimodal_placeholders(text: str) -> str:
+    """Remove common multimodal placeholders from decoded chat text.
+
+    When building auxiliary rubricator prompts from decoded token ids, residual
+    vision placeholders (e.g. Qwen-VL image tokens) can be preserved in text.
+    Sending such text without matching `image_data` may trigger SGLang/processor
+    index errors. This helper strips those placeholders for text-only prompts.
+    """
+    if not text:
+        return ""
+
+    s = str(text)
+    # Common multimodal placeholders across templates/backends.
+    for token in (
+        "<image>",
+        "[image]",
+        "<img>",
+        "<|image_pad|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|video_pad|>",
+        "<|audio_pad|>",
+    ):
+        s = s.replace(token, " ")
+
+    # Defensive collapse for any remaining qwen-vl style control tokens.
+    s = re.sub(r"<\|[^>]*?(image|vision|video|audio)[^>]*\|>", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 @dataclass
@@ -797,9 +829,10 @@ class RayPPOTrainer:
 
         rubric_prompts: list[str] = []
         for p, r in zip(prompts, responses, strict=True):
+            clean_context = _strip_multimodal_placeholders(p)
             rubric_prompts.append(
                 f"{RLCER_POLICY_RUBRICATOR_PROMPT}\n\n"
-                f"[Task Context]\n{p}\n\n"
+                f"[Task Context]\n{clean_context}\n\n"
                 f"[Solver Response]\n{r}\n\n"
                 "Return JSON only."
             )
