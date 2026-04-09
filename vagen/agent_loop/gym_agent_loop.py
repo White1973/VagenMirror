@@ -62,10 +62,29 @@ def _sanitize_mm_placeholder_text(text: str) -> str:
     if text is None:
         return ""
     s = str(text)
+    # 1) Replace fully valid vision triplet first.
+    s = re.sub(
+        r"<\|vision_start\|>\s*<\|image_pad\|>\s*<\|vision_end\|>",
+        "[image]",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"<\|vision_start\|>\s*<\|video_pad\|>\s*<\|vision_end\|>",
+        "[video]",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # 2) Replace common standalone placeholders/tokens.
     replacements = {
         "<image>": "[image]",
         "<video>": "[video]",
         "<img>": "[img]",
+        "<image_pad>": "[image_pad]",
+        "<video_pad>": "[video_pad]",
+        "<vision_start>": "[vision_start]",
+        "<vision_end>": "[vision_end]",
         "<|image_pad|>": "[image_pad]",
         "<|video_pad|>": "[video_pad]",
         "<|vision_start|>": "[vision_start]",
@@ -73,6 +92,9 @@ def _sanitize_mm_placeholder_text(text: str) -> str:
     }
     for src, dst in replacements.items():
         s = s.replace(src, dst)
+
+    # 3) Defensive regex for malformed/broken control-token variants
+    s = re.sub(r"<\|?\s*(image_pad|video_pad|vision_start|vision_end)\s*\|?>", r"[\1]", s, flags=re.IGNORECASE)
     return s
 
 
