@@ -853,6 +853,56 @@ class RayPPOTrainer:
         if len(prompts) == 0:
             return []
 
+        # Async rollout path: call server handles directly.
+        if self.async_rollout_mode:
+            server_handles = getattr(self.async_rollout_manager, "server_handles", None)
+            if not server_handles:
+                return None
+
+            rollout_cfg = self.config.actor_rollout_ref.rollout
+            if rollout_cfg.get("free_cache_engine", False):
+                self.async_rollout_manager.wake_up()
+
+            try:
+                tokenized = self.tokenizer(
+                    prompts,
+                    padding=False,
+                    truncation=True,
+                    max_length=self.config.data.max_prompt_length,
+                    return_tensors=None,
+                )
+                prompt_id_list = tokenized["input_ids"]
+
+                max_new_tokens = int(reward_cfg.get("policy_rubricator_max_new_tokens", 768))
+                sampling_params = {
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "max_new_tokens": max_new_tokens,
+                }
+
+                reqs = []
+                for i, ids in enumerate(prompt_id_list):
+                    server = server_handles[i % len(server_handles)]
+                    req_id = f"rlcer-rubric-{self.global_steps}-{i}-{uuid.uuid4().hex[:8]}"
+                    reqs.append(
+                        server.generate.remote(
+                            prompt_ids=torch.tensor(ids, dtype=torch.long),
+                            sampling_params=sampling_params,
+                            request_id=req_id,
+                            image_data=None,
+                        )
+                    )
+
+                outs = ray.get(reqs)
+                rubric_raws: list[str] = []
+                for out in outs:
+                    toks = list(out.token_ids)
+                    rubric_raws.append(self.tokenizer.decode(toks, skip_special_tokens=True))
+                return rubric_raws
+            finally:
+                if rollout_cfg.get("free_cache_engine", False):
+                    self.async_rollout_manager.sleep()
+
         tokenized = self.tokenizer(
             prompts,
             padding=True,
