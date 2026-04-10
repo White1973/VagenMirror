@@ -923,15 +923,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
-            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            if loop.is_running():
+                # In async agent-loop path, mode switching is managed externally (AgentLoopManager wake/sleep).
+                if self.config.rollout.mode != "async":
+                    raise RuntimeError(
+                        "Event loop is already running in non-async rollout mode; "
+                        "cannot safely switch to rollout mode in generate_sequences."
+                    )
+                logger.warning("Event loop already running in async mode; skip local switch to rollout mode")
+            else:
+                loop.run_until_complete(self.rollout_mode())
+                log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
-            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+            if loop.is_running():
+                if self.config.rollout.mode != "async":
+                    raise RuntimeError(
+                        "Event loop is already running in non-async rollout mode; "
+                        "cannot safely switch back to trainer mode in generate_sequences."
+                    )
+                logger.warning("Event loop already running in async mode; skip local switch to trainer mode")
+            else:
+                loop.run_until_complete(self.trainer_mode())
+                log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks
         # to make sure meta_info["timing"] is the same
