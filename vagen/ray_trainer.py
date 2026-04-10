@@ -884,9 +884,13 @@ class RayPPOTrainer:
                 for i, ids in enumerate(prompt_id_list):
                     server = server_handles[i % len(server_handles)]
                     req_id = f"rlcer-rubric-{self.global_steps}-{i}-{uuid.uuid4().hex[:8]}"
+                    # IMPORTANT: async sglang server expects single-request input_ids as
+                    # `list[int]` (batch mode is `list[list[int]]`).
+                    # Passing tensor here can be mis-normalized by sglang io_struct.
+                    prompt_ids = [int(x) for x in ids]
                     reqs.append(
                         server.generate.remote(
-                            prompt_ids=torch.tensor(ids, dtype=torch.long),
+                            prompt_ids=prompt_ids,
                             sampling_params=sampling_params,
                             request_id=req_id,
                             image_data=None,
