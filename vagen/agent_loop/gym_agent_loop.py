@@ -98,6 +98,28 @@ def _sanitize_mm_placeholder_text(text: str) -> str:
     return s
 
 
+def _build_mm_control_token_ids(tokenizer) -> set[int]:
+    """Collect multimodal control token ids that must not appear in plain text history."""
+    control_tokens = [
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
+    ]
+    ids: set[int] = set()
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        vocab = {}
+    for tok in control_tokens:
+        if tok in vocab:
+            try:
+                ids.add(int(tokenizer.convert_tokens_to_ids(tok)))
+            except Exception:
+                continue
+    return ids
+
+
 class AgentState(Enum):
     PENDING = "pending"
     GENERATING = "generating"
@@ -217,6 +239,7 @@ class GymAgentLoop(AgentLoopBase):
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         cls.response_length = config.actor_rollout_ref.rollout.response_length
+        cls.mm_control_token_ids = _build_mm_control_token_ids(cls.tokenizer)
       
         _placeholder = [{"role": "system", "content": "placeholder"}]
         if processor is not None:
@@ -377,14 +400,21 @@ class GymAgentLoop(AgentLoopBase):
                 image_data=agent_data.image_data,
             )
 
+        raw_response_ids = list(output.token_ids)
+        keep_mask = [tid not in self.mm_control_token_ids for tid in raw_response_ids]
+        filtered_response_ids = [tid for tid, keep in zip(raw_response_ids, keep_mask, strict=True) if keep]
+        removed_mm_tokens = len(raw_response_ids) - len(filtered_response_ids)
+        if removed_mm_tokens > 0:
+            agent_data.metrics["mm/filtered_control_tokens"] = agent_data.metrics.get("mm/filtered_control_tokens", 0) + removed_mm_tokens
 
-        agent_data.response_ids = output.token_ids
+        agent_data.response_ids = filtered_response_ids
         if len(output.token_ids)>agent_data.response_limit:
             logger.warning(f"In env:{agent_data.env_name}, generated response length {len(output.token_ids)} exceeds per-turn response_limit {agent_data.response_limit}")
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
-            agent_data.response_logprobs += output.log_probs
+            filtered_log_probs = [lp for lp, keep in zip(output.log_probs, keep_mask, strict=True) if keep]
+            agent_data.response_logprobs += filtered_log_probs
 
         # Cache assistant text and add assistant message (text-only)
         assistant_message = await self.loop.run_in_executor(
