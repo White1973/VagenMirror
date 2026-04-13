@@ -64,17 +64,10 @@ from vagen.utils.upload_hugging_face import HFUploadManager
 from vagen.utils.image_validation_logger import ValidationGenerationsLogger
 from vagen.utils.concat_val_multi_turn import concat_val_multi_turn
 from vagen.utils.image_token_utils import replace_image_tokens_for_logging
+from vagen.rlcer.prompt_templates import RLCER_RUBRICATOR_SYSTEM_PROMPT, RLCER_RUBRICATOR_USER_PROMPT
 import vagen.custom_advantage
 from vagen.custom_metric.metric import METRIC_REGISTRY
 from vagen.custom_filter.filter import FILTER_REGISTRY
-
-
-RLCER_POLICY_RUBRICATOR_PROMPT = (
-    "You are a rubric designer. Given a task context and a solver response, "
-    "generate JSON only with schema: "
-    '{"rubrics": [{"criterion": str, "points": number}, ...]}. '
-    "Use 4-8 binary-evaluable criteria and non-zero points."
-)
 
 
 def _strip_multimodal_placeholders(text: str) -> str:
@@ -106,6 +99,28 @@ def _strip_multimodal_placeholders(text: str) -> str:
     s = re.sub(r"<\|[^>]*?(image|vision|video|audio)[^>]*\|>", " ", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _flatten_chat_content(content) -> str:
+    """Flatten structured chat content into text (preserving <image>/<video> markers)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    chunks: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            chunks.append(str(item))
+            continue
+        t = item.get("type")
+        if t == "text":
+            chunks.append(str(item.get("text", "")))
+        elif t == "image":
+            chunks.append("<image>")
+        elif t == "video":
+            chunks.append("<video>")
+    return "".join(chunks)
 
 
 @dataclass
@@ -809,30 +824,88 @@ class RayPPOTrainer:
         reward_tensor[row_idx, col_idx] = scores
         return reward_tensor
 
-    def _build_rlcer_policy_rubricator_prompts(self, batch: DataProto) -> list[str]:
-        """Build rubricator prompts from current trajectories.
+    def _build_rlcer_policy_rubricator_prompts(self, batch: DataProto) -> tuple[list[list[int]], list[Optional[list]]]:
+        """Build rubricator model inputs from current trajectories.
 
-        These prompts are generated on driver side and sent to the SAME actor policy
-        (current training weights) for rubric proposal generation.
+        Each input includes:
+        - rubrics_generation-style system prompt
+        - rubrics_generation-style user prompt (with current observation image)
+        - current solver response context
         """
         response_ids = batch.batch["responses"]
         attention_mask = batch.batch["attention_mask"]
         prompt_len = batch.batch["prompts"].shape[-1]
         valid_response_lengths = attention_mask[:, prompt_len:].sum(dim=-1)
 
-        responses = []
+        responses: list[str] = []
         for i in range(len(batch)):
             valid_len = int(valid_response_lengths[i].item())
             responses.append(self.tokenizer.decode(response_ids[i][:valid_len], skip_special_tokens=True))
 
-        rubric_prompts: list[str] = []
-        for r in responses:
-            rubric_prompts.append(
-                f"{RLCER_POLICY_RUBRICATOR_PROMPT}\n\n"
-                f"[Solver Response]\n{r}\n\n"
-                "Return JSON only."
+        image_batch = batch.non_tensor_batch.get("image_data", [None] * len(batch))
+        prompt_id_list: list[list[int]] = []
+        image_payloads: list[Optional[list]] = []
+
+        for i, r in enumerate(responses):
+            img_item = image_batch[i] if i < len(image_batch) else None
+            if isinstance(img_item, list):
+                current_image = img_item[-1] if len(img_item) > 0 else None
+            else:
+                current_image = img_item
+
+            user_tail = (
+                f"\n\n[Turn ID]\nturn_{int(self.global_steps):06d}\n"
+                f"\n[Solver Response]\n{_strip_multimodal_placeholders(r)}\n"
+                "\n[Constraint]\nReturn ONLY the JSON in a json block."
             )
-        return rubric_prompts
+
+            if self.processor is not None:
+                messages = [
+                    {"role": "system", "content": RLCER_RUBRICATOR_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "[Initial Observation]:\n"},
+                            {"type": "image"},
+                            {
+                                "type": "text",
+                                "text": "\nAnalyze the current Sokoban board state and generate evaluation rubrics."
+                                + user_tail,
+                            },
+                        ],
+                    },
+                ]
+                raw_prompt = self.processor.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                model_inputs = self.processor(
+                    text=[raw_prompt],
+                    images=[current_image] if current_image is not None else None,
+                    return_tensors="pt",
+                )
+                ids = model_inputs["input_ids"].squeeze(0).tolist()
+            else:
+                flat_messages = [
+                    {"role": "system", "content": RLCER_RUBRICATOR_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"{RLCER_RUBRICATOR_USER_PROMPT}\n{user_tail}",
+                    },
+                ]
+                ids = self.tokenizer.apply_chat_template(
+                    flat_messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=False,
+                )
+
+            ids = [int(x) for x in ids][-int(self.config.data.max_prompt_length) :]
+            prompt_id_list.append(ids)
+            image_payloads.append([current_image] if current_image is not None else None)
+
+        return prompt_id_list, image_payloads
 
     def _generate_rlcer_policy_rubrics_with_current_actor(self, batch: DataProto) -> list[str] | None:
         """Generate rubric proposals using the CURRENT actor policy.
@@ -849,8 +922,8 @@ class RayPPOTrainer:
         if not use_actor_policy:
             return None
 
-        prompts = self._build_rlcer_policy_rubricator_prompts(batch)
-        if len(prompts) == 0:
+        prompt_id_list, image_payloads = self._build_rlcer_policy_rubricator_prompts(batch)
+        if len(prompt_id_list) == 0:
             return []
 
         # Async rollout path: call server handles directly.
@@ -864,15 +937,6 @@ class RayPPOTrainer:
                 self.async_rollout_manager.wake_up()
 
             try:
-                tokenized = self.tokenizer(
-                    prompts,
-                    padding=False,
-                    truncation=True,
-                    max_length=self.config.data.max_prompt_length,
-                    return_tensors=None,
-                )
-                prompt_id_list = tokenized["input_ids"]
-
                 max_new_tokens = int(reward_cfg.get("policy_rubricator_max_new_tokens", 768))
                 sampling_params = {
                     "temperature": 0.0,
@@ -884,16 +948,12 @@ class RayPPOTrainer:
                 for i, ids in enumerate(prompt_id_list):
                     server = server_handles[i % len(server_handles)]
                     req_id = f"rlcer-rubric-{self.global_steps}-{i}-{uuid.uuid4().hex[:8]}"
-                    # IMPORTANT: async sglang server expects single-request input_ids as
-                    # `list[int]` (batch mode is `list[list[int]]`).
-                    # Passing tensor here can be mis-normalized by sglang io_struct.
-                    prompt_ids = [int(x) for x in ids]
                     reqs.append(
                         server.generate.remote(
-                            prompt_ids=prompt_ids,
+                            prompt_ids=ids,
                             sampling_params=sampling_params,
                             request_id=req_id,
-                            image_data=None,
+                            image_data=image_payloads[i],
                         )
                     )
 
@@ -907,15 +967,16 @@ class RayPPOTrainer:
                 if rollout_cfg.get("free_cache_engine", False):
                     self.async_rollout_manager.sleep()
 
-        tokenized = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=self.config.data.max_prompt_length,
-            return_tensors="pt",
-        )
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        max_len = max(len(x) for x in prompt_id_list)
+        input_ids = torch.full((len(prompt_id_list), max_len), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(prompt_id_list), max_len), dtype=torch.long)
+        for i, ids in enumerate(prompt_id_list):
+            l = len(ids)
+            if l == 0:
+                continue
+            input_ids[i, :l] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[i, :l] = 1
         position_ids = attention_mask.long().cumsum(dim=-1) - 1
         position_ids = position_ids.masked_fill(attention_mask == 0, 0)
 
@@ -934,6 +995,10 @@ class RayPPOTrainer:
             "validate": False,
             "global_steps": self.global_steps,
         }
+        rubric_gen_batch.non_tensor_batch["multi_modal_data"] = np.array(
+            [{"image": imgs} if imgs is not None else None for imgs in image_payloads],
+            dtype=object,
+        )
 
         # Use actor rollout worker directly so rubricator always follows latest actor updates.
         rubric_out = self.actor_rollout_wg.generate_sequences(rubric_gen_batch)
