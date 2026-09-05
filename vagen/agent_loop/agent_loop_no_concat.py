@@ -527,7 +527,16 @@ class AgentLoopWorkerBase:
                     )
                     result = await self.reward_manager_worker.compute_score.remote(data)
                     output.reward_score = result["reward_score"]
-                    output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+                    # Merge instead of overwrite: keep env-forwarded metrics already
+                    # in extra_fields["reward_extra_info"] (e.g. SVG dino_score /
+                    # dreamsim_score written by the agent loop) and only add/override
+                    # with the keys the reward manager produced. The previous
+                    # assignment discarded all env-side metrics, so they never reached
+                    # wandb (aux/<env>/<key>) — only traj_success survived because it
+                    # was re-derived downstream.
+                    _merged = dict(output.extra_fields.get("reward_extra_info", {}))
+                    _merged.update(result.get("reward_extra_info", {}) or {})
+                    output.extra_fields["reward_extra_info"] = _merged
 
                 internal_outputs.append(_InternalAgentLoopOutput(
                     prompt_ids=prompt_output["input_ids"],
@@ -590,12 +599,16 @@ class AgentLoopWorkerBase:
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            temp_arr = np.empty(len(reward_extra_infos), dtype=object)
+            temp_arr[:] = [info[key] for info in reward_extra_infos]
+            non_tensor_batch[key] = temp_arr
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
         if any(mmi is not None for mmi in multi_modal_inputs_list):
-            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
+            temp_arr = np.empty(len(multi_modal_inputs_list), dtype=object)
+            temp_arr[:] = multi_modal_inputs_list
+            non_tensor_batch["multi_modal_inputs"] = temp_arr
 
         metrics = [input.metrics.model_dump() for input in inputs]
         # Collect extra fields from all inputs and convert them to np.ndarray
