@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -370,6 +371,12 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        # Protected multi-role update uses this routine as a backward-only
+        # primitive. Normal callers retain the original per-mini-batch step.
+        defer_optimizer_step = bool(data.meta_info.get("defer_optimizer_step", False))
+        if defer_optimizer_step and self.config.ppo_epochs != 1:
+            raise ValueError("defer_optimizer_step requires ppo_epochs=1")
+
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -396,8 +403,13 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if "rlcer_role" in data.non_tensor_batch.keys():
+            non_tensor_select_keys.append("rlcer_role")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        # Determine dual-role from meta_info (set by trainer) for consistent metric keys across all DP workers
+        batch_has_dual_role = data.meta_info.get("batch_has_dual_role", False)
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -406,6 +418,8 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        if defer_optimizer_step:
+            self.actor_optimizer.zero_grad()
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -417,7 +431,8 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
+                if not defer_optimizer_step:
+                    self.actor_optimizer.zero_grad()
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -434,6 +449,10 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
+                    if defer_optimizer_step:
+                        # A protected role contributes one batch-level gradient,
+                        # independent of how many PPO mini-batches it contains.
+                        loss_scale_factor /= max(len(mini_batches), 1)
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
@@ -464,22 +483,110 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
-                    micro_batch_metrics.update(pg_metrics)
+                    rlcer_roles = model_inputs.get("rlcer_role", None)
 
-                    # Skip if using pure rollout correction mode (metrics already in pg_metrics)
+                    if batch_has_dual_role and rlcer_roles is not None:
+                        is_reasoner = torch.tensor(
+                            [r == "reasoner" for r in rlcer_roles], dtype=torch.bool, device=response_mask.device
+                        )
+                        rea_mask = response_mask * is_reasoner.unsqueeze(1).float()
+                        rub_mask = response_mask * (~is_reasoner).unsqueeze(1).float()
+
+                        rub_w = data.meta_info.get("rubricator_loss_weight", 0.0)
+
+                        pg_loss_rea, pg_metrics_rea = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=rea_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        pg_loss_rub, pg_metrics_rub = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=rub_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        micro_batch_metrics.update(pg_metrics_rea)
+
+                        # Per-role diagnostics (validation-1):
+                        # ppo_kl on the role mask == mean(logπ_new - logπ_old) over that
+                        # role's tokens, i.e. the average log-ratio driving KL. Splitting it
+                        # tells us whether the rubricator or the reasoner pushes policy drift.
+                        for _metrics, _suffix in (
+                            (pg_metrics_rea, "reasoner"),
+                            (pg_metrics_rub, "rubricator"),
+                        ):
+                            for _k, _v in _metrics.items():
+                                _base = _k.split("/", 1)[1] if "/" in _k else _k
+                                micro_batch_metrics[f"actor/{_base}_{_suffix}"] = _v
+
+                        pg_loss = pg_loss_rea + rub_w * pg_loss_rub
+
+                        if entropy_coeff != 0:
+                            ent_rea = agg_loss(loss_mat=entropy, loss_mask=rea_mask, loss_agg_mode=loss_agg_mode)
+                            ent_rub = agg_loss(loss_mat=entropy, loss_mask=rub_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = pg_loss - entropy_coeff * (ent_rea + rub_w * ent_rub)
+                            micro_batch_metrics["actor/entropy_reasoner"] = ent_rea.detach().item()
+                            micro_batch_metrics["actor/entropy_rubricator"] = ent_rub.detach().item()
+                        else:
+                            policy_loss = pg_loss
+
+                        if self.config.use_kl_loss:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_rea = agg_loss(loss_mat=kld, loss_mask=rea_mask, loss_agg_mode=loss_agg_mode)
+                            kl_rub = agg_loss(loss_mat=kld, loss_mask=rub_mask, loss_agg_mode=loss_agg_mode)
+                            kl_loss = kl_rea + rub_w * kl_rub
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_loss_reasoner"] = kl_rea.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_loss_rubricator"] = kl_rub.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                            # Per-role KL constraint (validation-1 extension): allow a separate,
+                            # stronger KL coef for the rubricator side when provided via meta_info.
+                            rub_kl_coef = data.meta_info.get("rubricator_kl_loss_coef", None)
+                            if rub_kl_coef is not None and rub_kl_coef != self.config.kl_loss_coef:
+                                policy_loss = policy_loss + (rub_kl_coef - self.config.kl_loss_coef) * rub_w * kl_rub
+                                micro_batch_metrics["actor/kl_coef_rubricator"] = rub_kl_coef
+                    else:
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        micro_batch_metrics.update(pg_metrics)
+
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
+
+                        if self.config.use_kl_loss:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    # Rollout correction metrics (role-agnostic, computed on full mask)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
                     if loss_mode != "rollout_correction" and rollout_log_prob is not None:
-                        # Compute metrics using CURRENT policy π_θ vs π_rollout
-                        # Tracks evolving off-policy gap as π_θ updates during mini-batch training
                         from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
 
                         rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
@@ -488,26 +595,6 @@ class DataParallelPPOActor(BasePPOActor):
                             response_mask=response_mask,
                         )
                         micro_batch_metrics.update(rollout_corr_metrics)
-
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
-
-                    if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
@@ -522,8 +609,128 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, mini_batch_metrics)
+                if not defer_optimizer_step:
+                    grad_norm = self._optimizer_step()
+                    mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                    append_to_dict(metrics, mini_batch_metrics)
+        if not defer_optimizer_step:
+            self.actor_optimizer.zero_grad()
+        return metrics
+
+    def update_policy_protected_multirole(self, data: DataProto):
+        """One-step asymmetric PCGrad update for a fully shared dual-role actor.
+
+        Forward/backward passes stay isolated by role. Both gradients are
+        evaluated at the same parameter version. A conflicting rubricator
+        component is projected away, its norm is capped relative to the
+        reasoner gradient, and exactly one optimizer step is performed.
+        """
+        if self.scaler is not None:
+            raise NotImplementedError("protected multirole update currently requires bf16/fp32")
+        roles = data.non_tensor_batch.get("rlcer_role")
+        if roles is None:
+            raise ValueError("protected multirole update requires rlcer_role")
+        roles = np.asarray(roles)
+        reasoner_idx = np.where(roles == "reasoner")[0]
+        rubricator_idx = np.where(roles == "rubricator")[0]
+        if len(reasoner_idx) == 0 or len(rubricator_idx) == 0:
+            raise ValueError("protected multirole update requires both roles")
+
+        reasoner = data[reasoner_idx]
+        rubricator = data[rubricator_idx]
+        for role_batch in (reasoner, rubricator):
+            role_batch.meta_info["batch_has_dual_role"] = False
+            role_batch.meta_info["defer_optimizer_step"] = True
+            role_batch.meta_info.pop("rubricator_loss_weight", None)
+            role_batch.meta_info.pop("rubricator_kl_loss_coef", None)
+
+        reasoner_metrics = self.update_policy(reasoner)
+        params = [p for p in self.actor_module.parameters() if p.requires_grad]
+        reasoner_grads = [None if p.grad is None else p.grad.detach().clone() for p in params]
+
+        rubricator_metrics = self.update_policy(rubricator)
+        rubricator_grads = [None if p.grad is None else p.grad.detach().clone() for p in params]
+
+        device = next((g.device for g in reasoner_grads if g is not None), get_device_id())
+        dot = torch.zeros((), device=device, dtype=torch.float32)
+        reasoner_sq = torch.zeros_like(dot)
+        rubricator_sq = torch.zeros_like(dot)
+        for g_r, g_u in zip(reasoner_grads, rubricator_grads, strict=True):
+            if g_r is not None:
+                reasoner_sq += g_r.float().square().sum()
+            if g_u is not None:
+                rubricator_sq += g_u.float().square().sum()
+            if g_r is not None and g_u is not None:
+                dot += (g_r.float() * g_u.float()).sum()
+
+        if torch.distributed.is_initialized():
+            packed = torch.stack([dot, reasoner_sq, rubricator_sq])
+            torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+            dot, reasoner_sq, rubricator_sq = packed.unbind()
+
+        eps = 1e-12
+        reasoner_norm = torch.sqrt(reasoner_sq.clamp_min(eps))
+        rubricator_norm = torch.sqrt(rubricator_sq.clamp_min(eps))
+        cosine = dot / (reasoner_norm * rubricator_norm).clamp_min(eps)
+        projection_coeff = torch.where(
+            dot < 0,
+            dot / reasoner_sq.clamp_min(eps),
+            torch.zeros_like(dot),
+        )
+
+        cap_ratio = max(0.0, float(data.meta_info.get("rubricator_grad_norm_ratio_cap", 0.02)))
+        projected_sq = torch.zeros_like(dot)
+        projected_grads = []
+        coeff = projection_coeff.to(dtype=torch.float32)
+        for g_r, g_u in zip(reasoner_grads, rubricator_grads, strict=True):
+            if g_u is None:
+                projected_grads.append(None)
+                continue
+            projected = g_u.float()
+            if g_r is not None and float(projection_coeff.item()) < 0.0:
+                projected = projected - coeff * g_r.float()
+            projected_grads.append(projected)
+            projected_sq += projected.square().sum()
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(projected_sq, op=torch.distributed.ReduceOp.SUM)
+        projected_norm = torch.sqrt(projected_sq.clamp_min(eps))
+        cap_scale = min(1.0, float((cap_ratio * reasoner_norm / projected_norm).item()))
+
         self.actor_optimizer.zero_grad()
+        for param, g_r, g_u in zip(params, reasoner_grads, projected_grads, strict=True):
+            combined = None
+            grad_dtype = None
+            if g_r is not None:
+                combined = g_r.float()
+                grad_dtype = g_r.dtype
+            if g_u is not None:
+                auxiliary = g_u * cap_scale
+                combined = auxiliary if combined is None else combined + auxiliary
+                grad_dtype = g_u.dtype if grad_dtype is None else grad_dtype
+            if combined is not None:
+                param.grad = combined.to(dtype=grad_dtype)
+
+        combined_grad_norm = self._optimizer_step()
+        self.actor_optimizer.zero_grad()
+
+        metrics = {}
+        for key, value in reasoner_metrics.items():
+            metrics[key] = value
+        for key, value in rubricator_metrics.items():
+            suffix = key.split("/", 1)[1] if "/" in key else key
+            metrics[f"actor_rub/{suffix}"] = value
+        metrics.update(
+            {
+                "rlcer/grad/reasoner_norm": float(reasoner_norm.item()),
+                "rlcer/grad/rubricator_norm": float(rubricator_norm.item()),
+                "rlcer/grad/cosine": float(cosine.item()),
+                "rlcer/grad/conflict": float(dot.item() < 0.0),
+                "rlcer/grad/projected_rubricator_norm": float(projected_norm.item()),
+                "rlcer/grad/rubricator_cap_scale": cap_scale,
+                "rlcer/grad/rubricator_effective_ratio": float(
+                    min(cap_ratio, (projected_norm * cap_scale / reasoner_norm).item())
+                ),
+                "actor/grad_norm": float(combined_grad_norm.detach().item()),
+            }
+        )
         return metrics
