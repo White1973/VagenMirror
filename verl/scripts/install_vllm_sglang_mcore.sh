@@ -51,5 +51,5 @@ if [ $USE_MEGATRON -eq 1 ]; then
     echo "6. Install cudnn python package (avoid being overridden)"
     pip install nvidia-cudnn-cu12==9.10.2.21
 fi
-
+pip install tenacity bs4 cairosvg svgpathtools dreamsim
 echo "Successfully installed all packages"
