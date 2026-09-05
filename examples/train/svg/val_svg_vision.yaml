@@ -1,0 +1,24 @@
+envs:
+  - name: SVG
+    n_envs: 32
+    data_source: svg
+    seed: [10001,10032,1]
+    max_turns: 2
+    response_length_per_turn: 2048
+    config:
+      render_mode: vision
+      dataset_name: starvector/svg-icons-simple
+      data_dir: data
+      split: train
+      prompt_format: free_think
+      use_example_in_sys_prompt: true
+      format_reward: 0.5
+      format_penalty: 0.0
+      model_size: small
+      dino_weight: 0.0001
+      structural_weight: 0.0
+      dreamsim_weight: 5.0
+      device:
+        dino: 0
+        dreamsim: 0
+      resolution: 256
