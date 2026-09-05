@@ -221,6 +221,79 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # Per-role metrics for dual-role (rlcer) batches.
+    # When rubricator samples are present, the joint-batch token-level mean of
+    # returns/values is diluted by rubricator's near-zero entries.  Computing
+    # reasoner-only statistics lets us disentangle metric dilution from genuine
+    # critic/training issues.  We also emit rubricator-side stats and valid-token
+    # counts so the *dilution ratio* itself is observable, not just the means.
+    rlcer_role = batch.non_tensor_batch.get("rlcer_role", None)
+    if rlcer_role is not None:
+        is_rea = np.array([r == "reasoner" for r in rlcer_role])
+        n_rea = int(is_rea.sum())
+        n_rub = int((~is_rea).sum())
+        metrics["rlcer/role_count/reasoner"] = float(n_rea)
+        metrics["rlcer/role_count/rubricator"] = float(n_rub)
+
+        rea_valid_tokens = 0
+        if n_rea > 0:
+            # Use torch index tensors for device safety (numpy fancy-index on a
+            # GPU tensor is accepted in recent torch but errors on older verl).
+            rea_idx = torch.as_tensor(np.where(is_rea)[0], device=returns.device, dtype=torch.long)
+            rea_resp_mask = response_mask[rea_idx]
+            rea_valid_tokens = int(rea_resp_mask.sum().item())
+            metrics["rlcer/valid_tokens/reasoner"] = float(rea_valid_tokens)
+
+            # Per-sequence score/reward (reasoner only, non-aborted)
+            rea_non_aborted = non_aborted_mask.cpu().numpy()[is_rea]
+            if rea_non_aborted.any():
+                rea_non_aborted_idx = torch.as_tensor(np.where(is_rea)[0][rea_non_aborted], device=returns.device, dtype=torch.long)
+                metrics["critic/score_reasoner/mean"] = torch.mean(sequence_score[rea_non_aborted_idx]).detach().item()
+                metrics["critic/rewards_reasoner/mean"] = torch.mean(sequence_reward[rea_non_aborted_idx]).detach().item()
+
+            # Per-token returns/advantages (reasoner only)
+            rea_returns = torch.masked_select(returns[rea_idx], rea_resp_mask)
+            rea_adv = torch.masked_select(advantages[rea_idx], rea_resp_mask)
+            if rea_returns.numel() > 0:
+                metrics["critic/returns_reasoner/mean"] = torch.mean(rea_returns).detach().item()
+                metrics["critic/returns_reasoner/max"] = torch.max(rea_returns).detach().item()
+                metrics["critic/returns_reasoner/min"] = torch.min(rea_returns).detach().item()
+            if rea_adv.numel() > 0:
+                metrics["critic/advantages_reasoner/mean"] = torch.mean(rea_adv).detach().item()
+
+            if use_critic:
+                rea_values = torch.masked_select(values[rea_idx], rea_resp_mask)
+                if rea_values.numel() > 0 and rea_returns.numel() > 0:
+                    metrics["critic/values_reasoner/mean"] = torch.mean(rea_values).detach().item()
+                    metrics["critic/values_reasoner/max"] = torch.max(rea_values).detach().item()
+                    metrics["critic/values_reasoner/min"] = torch.min(rea_values).detach().item()
+                    rea_return_diff_var = torch.var(rea_returns - rea_values)
+                    rea_return_var = torch.var(rea_returns)
+                    metrics["critic/vf_explained_var_reasoner"] = (
+                        1.0 - rea_return_diff_var / (rea_return_var + 1e-5)
+                    ).detach().item()
+
+        # Rubricator side: near-zero returns/advantages on non-terminal tokens.
+        # These are the diluting entries; emitting their stats + token share lets
+        # the reasoner-vs-joint divergence be read off directly.
+        if n_rub > 0:
+            rub_idx = torch.as_tensor(np.where(~is_rea)[0], device=returns.device, dtype=torch.long)
+            rub_resp_mask = response_mask[rub_idx]
+            rub_valid_tokens = int(rub_resp_mask.sum().item())
+            metrics["rlcer/valid_tokens/rubricator"] = float(rub_valid_tokens)
+            if rea_valid_tokens > 0 and rub_valid_tokens > 0:
+                metrics["rlcer/valid_token_ratio/reasoner"] = float(
+                    rea_valid_tokens / (rea_valid_tokens + rub_valid_tokens)
+                )
+            rub_returns = torch.masked_select(returns[rub_idx], rub_resp_mask)
+            if rub_returns.numel() > 0:
+                metrics["critic/returns_rubricator/mean"] = torch.mean(rub_returns).detach().item()
+                metrics["critic/returns_rubricator/max"] = torch.max(rub_returns).detach().item()
+                if use_critic:
+                    rub_values = torch.masked_select(values[rub_idx], rub_resp_mask)
+                    if rub_values.numel() > 0:
+                        metrics["critic/values_rubricator/mean"] = torch.mean(rub_values).detach().item()
+
     return metrics
 
 
@@ -439,12 +512,28 @@ def process_validation_metrics(
                 if isinstance(var_vals[0], str):
                     continue
 
+                # Skip non-numeric / None entries. Frozenlake's rlcer reward-extra
+                # pipeline can emit None for fields not applicable on a given
+                # sample (e.g. first-turn history fields). np.mean on a list
+                # containing None raises
+                # `unsupported operand type(s) for /: 'NoneType' and 'int'`.
+                # The original str-only guard did not catch None, so filter
+                # numeric values here and skip the whole group if none remain.
+                numeric_vals = [
+                    v for v in var_vals
+                    if v is not None and isinstance(v, (int, float, np.integer, np.floating, np.bool_))
+                ]
+                if not numeric_vals:
+                    continue
+
                 metric = {}
-                n_resps = len(var_vals)
-                metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                n_resps = len(numeric_vals)
+                # Cast numpy scalars to native float: these metrics are later
+                # serialized (wandb.log / json / ray), where np.float64 raises.
+                metric[f"mean@{n_resps}"] = float(np.mean(numeric_vals))
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = np.std(var_vals)
+                    metric[f"std@{n_resps}"] = float(np.std(numeric_vals))
 
                     ns = []
                     n = 2
@@ -455,13 +544,17 @@ def process_validation_metrics(
 
                     for n in ns:
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
-                            data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
+                            data=numeric_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )
-                        metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
-                        metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+                        metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = float(bon_mean), float(bon_std)
+                        metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = float(won_mean), float(won_std)
                         if var2vals.get("pred", None) is not None:
+                            # Pair val/pred only on non-None vals to avoid None
+                            # flowing into bootstrap / majority-vote reduce.
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"], strict=True)
+                                {"val": val, "pred": pred}
+                                for val, pred in zip(var_vals, var2vals["pred"], strict=True)
+                                if val is not None
                             ]
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(
                                 data=vote_data,
@@ -469,7 +562,7 @@ def process_validation_metrics(
                                 reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
                                 seed=seed,
                             )
-                            metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+                            metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = float(maj_n_mean), float(maj_n_std)
 
                 data_src2uid2var2metric[data_source][uid][var_name] = metric
 
@@ -485,6 +578,6 @@ def process_validation_metrics(
     for data_source, var2metric2uid_vals in data_src2var2metric2uid_vals.items():
         for var_name, metric2uid_vals in var2metric2uid_vals.items():
             for metric_name, uid_vals in metric2uid_vals.items():
-                data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
+                data_src2var2metric2val[data_source][var_name][metric_name] = float(np.mean(uid_vals))
 
     return data_src2var2metric2val
