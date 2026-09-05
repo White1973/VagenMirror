@@ -17,10 +17,54 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+import signal
+import traceback
+from copy import deepcopy
 
 import hydra
 import ray
 from omegaconf import OmegaConf
+
+
+def _install_signal_diagnostics():
+    """Print which signal ends the process and a stack trace when it dies.
+
+    Used to diagnose the step-~90 early-termination: if the run ends with
+    SIGTERM/SIGKILL here, the cause is an external/platform-level timeout
+    (not a code bug, not OOM). Without this we only see wandb's atexit
+    BrokenPipe, which is a consequence rather than the cause.
+    """
+    def _handler(signum, frame):
+        try:
+            sig_name = signal.Signals(signum).name
+        except Exception:
+            sig_name = str(signum)
+        print(
+            f"\n[signal-diag] main process received signal {signum} ({sig_name})",
+            flush=True,
+        )
+        try:
+            print("[signal-diag] stack at signal:\n" + "".join(traceback.format_stack(frame)), flush=True)
+        except Exception:
+            pass
+        # Re-raise default behaviour so the platform sees the real exit cause.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for _s in (signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2):
+        try:
+            signal.signal(_s, _handler)
+        except Exception:
+            pass
+
+    def _atexit_diag():
+        print(f"[signal-diag] main process exiting via atexit (normal Python shutdown)", flush=True)
+
+    import atexit
+    atexit.register(_atexit_diag)
+
+
+_install_signal_diagnostics()
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -289,11 +333,19 @@ class TaskRunner:
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         # Load the reward manager for training and validation.
+        print('####'*10, **config.reward_model.get("reward_kwargs", {}))
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
+        # For validation, enable pure_outcome mode to skip RLCER rubric computation
+        val_cfg = deepcopy(config)
+        OmegaConf.set_struct(val_cfg, False)
+        try:
+            val_cfg.custom_reward_function.reward_kwargs["pure_outcome"] = True
+        except Exception:
+            pass
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            val_cfg, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
