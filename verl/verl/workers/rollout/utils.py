@@ -49,17 +49,35 @@ async def run_unvicorn(app: FastAPI, server_args, server_address, max_retries=5)
     server_port, server_task = None, None
 
     for i in range(max_retries):
+        sock = None
         try:
             server_port, sock = get_free_port(server_address)
             app.server_args = server_args
             config = uvicorn.Config(app, host=server_address, port=server_port, log_level="warning")
             server = uvicorn.Server(config)
-            server.should_exit = True
-            await server.serve()
-            server_task = asyncio.create_task(server.main_loop())
+
+            # Keep the complete Uvicorn lifecycle in the background task.  The
+            # previous implementation set should_exit before serve(), so newer
+            # Uvicorn versions immediately shut the listener down and then ran
+            # main_loop() against an already-closed server.
+            server_task = asyncio.create_task(server.serve(sockets=[sock]))
+
+            # Do not publish the port until Uvicorn has completed startup.
+            while not server.started:
+                if server_task.done():
+                    # Propagate startup failures so the retry loop can select a
+                    # fresh port. task.result() raises the original exception.
+                    server_task.result()
+                    raise RuntimeError(f"HTTP server exited during startup on port {server_port}")
+                await asyncio.sleep(0.01)
             break
-        except (OSError, SystemExit) as e:
+        except (OSError, RuntimeError, SystemExit) as e:
             logger.error(f"Failed to start HTTP server on port {server_port} at try {i}, error: {e}")
+            if server_task is not None and not server_task.done():
+                server_task.cancel()
+                await asyncio.gather(server_task, return_exceptions=True)
+            if sock is not None:
+                sock.close()
     else:
         logger.error(f"Failed to start HTTP server after {max_retries} retries, exiting...")
         os._exit(-1)
