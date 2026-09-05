@@ -65,7 +65,8 @@ class AgentData:
 
         # Env stats
         self.env_turns: int = 0
-
+        self.turn_env_states: List[dict] = []
+        self.initial_env_state: Optional[dict] = None
 
         # Cached assistant text to step env
         self.last_assistant_text: Optional[str] = None
@@ -143,6 +144,7 @@ class GymAgentLoop(AgentLoopBase):
             group_idx=kwargs["group_idx"],
             traj_idx=kwargs["traj_idx"],
         )
+        agent_data.initial_env_state = info.get("initial_env_state", None)
 
         # State machine: always GENERATE -> INTERACT, and decide termination inside INTERACT
         state = AgentState.PENDING
@@ -250,6 +252,28 @@ class GymAgentLoop(AgentLoopBase):
 
         traj_success = extract_success(info)
         agent_data.env_turns += 1
+        if "env_state" in info:
+            agent_data.turn_env_states.append(info["env_state"])
+
+        # Forward env-specific numeric metrics (e.g. SVG's dino_score /
+        # dreamsim_score) from the env info dict into reward_extra_info so they
+        # get aggregated and logged to wandb as aux/<env>/<key>. Without this,
+        # only traj_success (extracted above) is forwarded and per-step quality
+        # signals computed by the environment are silently dropped.
+        #
+        # Always emit every key with a default of 0.0 so that all samples in a
+        # batch share identical reward_extra_info keys (the agent-loop collator
+        # at agent_loop_no_concat.py:594 indexes by key without .get(), so a
+        # missing key on any sample would raise KeyError). Envs that don't
+        # produce a given metric simply report 0.0.
+        env_metric_keys = ("dino_score", "dreamsim_score")
+        env_metrics = {}
+        for _k in env_metric_keys:
+            _v = info.get(_k, 0.0)
+            try:
+                env_metrics[_k] = float(_v)
+            except (TypeError, ValueError):
+                env_metrics[_k] = 0.0
         last_turn=False
         
         
@@ -282,13 +306,16 @@ class GymAgentLoop(AgentLoopBase):
             num_turns=1,
             metrics=agent_data.metrics,
             extra_fields={"reward_extra_info": {
-                "traj_success": float(traj_success)},
+                "traj_success": float(traj_success),
+                **env_metrics,
+            },
                 "image_data": turn_images,
                 "last_turn": last_turn,
                 "group_idx": agent_data.group_idx,
                 "traj_idx": agent_data.traj_idx,
                 "turn_idx": agent_data.env_turns,
-                          
+                "turn_env_states": list(agent_data.turn_env_states),
+                "initial_env_state": agent_data.initial_env_state,
             },
         )
         agent_data.outputs.append(output)
