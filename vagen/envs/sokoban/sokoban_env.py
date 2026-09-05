@@ -107,7 +107,14 @@ class Sokoban(GymImageEnv):
         self.total_reward = 0.0
         self.valid_actions = []
         obs = await self._render_async(init_obs=True)
-        info: Dict[str, Any] = {}
+        info: Dict[str, Any] = {
+            "initial_env_state": {
+                "player_pos": self.env.player_position.tolist(),
+                "box_positions": np.argwhere((self.env.room_state == 4) | (self.env.room_state == 3)).tolist(),
+                "target_positions": np.argwhere(self.env.room_fixed == 2).tolist(),
+                "boxes_on_target": 0,
+            }
+        }
         return obs, info
 
     async def system_prompt(self) -> Dict[str, Any]:
@@ -180,6 +187,15 @@ class Sokoban(GymImageEnv):
 
         info["metrics"] = metrics
         info["success"] = metrics["traj_metrics"]["success"]
+        info["env_state"] = {
+            "player_pos": self.env.player_position.tolist(),
+            "box_positions": np.argwhere((self.env.room_state == 4) | (self.env.room_state == 3)).tolist(),
+            "target_positions": np.argwhere(self.env.room_fixed == 2).tolist(),
+            "boxes_on_target": int(self.env.boxes_on_target),
+            "action_is_valid": metrics["turn_metrics"]["action_is_valid"],
+            "action_is_effective": metrics["turn_metrics"]["action_is_effective"],
+            "valid_actions_executed": list(self.valid_actions),
+        }
         self.total_reward += reward
 
         obs = await self._render_async(init_obs=False)
