@@ -43,6 +43,11 @@ class BatchRewardManager(AbstractRewardManager):
         self.compute_score = compute_score
         self.reward_fn_key = reward_fn_key
         self.reward_kwargs = reward_kwargs
+        # Mark whether the compute_score is a custom (user-provided) reward function.
+        # Custom reward functions (e.g. RLCER) should always be invoked even when
+        # rm_scores from the environment already exist, because they may combine
+        # the outcome reward with additional signals (cot_reward, rubricator_reward, etc.).
+        self._is_custom_reward_fn = getattr(compute_score, '_is_custom_reward_fn', False)
 
     def verify(self, data):
         prompt_ids = data.batch["prompts"]
@@ -63,14 +68,39 @@ class BatchRewardManager(AbstractRewardManager):
             prompt_str = self.tokenizer.decode(prompt_ids[i], skip_special_tokens=True)
             prompts_str.append(prompt_str)
 
-        ground_truths = [item.non_tensor_batch["reward_model"].get("ground_truth", None) for item in data]
+        ground_truths = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in data]
         data_sources = data.non_tensor_batch[self.reward_fn_key]
         rollout_reward_scores = data.non_tensor_batch.get("reward_scores", [{} for _ in range(len(data))])
         extras = data.non_tensor_batch.get("extra_info", [{} for _ in range(len(data))])
+        reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+        # Environment-side fields (for example traj_success, dino_score and
+        # dreamsim_score) must be visible to the custom reward function, not
+        # only merged into the returned logging dictionary after scoring.
+        # RLCER uses these values as the grounded target z for rubric
+        # validation.
+        score_context_keys = set(reward_extra_keys) | {
+            "traj_success",
+            "dino_score",
+            "dreamsim_score",
+            "turn_env_states",
+            "initial_env_state",
+            "verifier_context",
+        }
 
         for i in range(len(data)):
             extras[i]["rollout_reward_scores"] = rollout_reward_scores[i]
             extras[i]["prompt_str"] = prompts_str[i]
+            for key in score_context_keys:
+                if key in data.non_tensor_batch:
+                    extras[i][key] = data.non_tensor_batch[key][i]
+            # Pass environment reward (rm_scores) to custom reward functions so
+            # they can use it as outcome reward instead of relying on
+            # default_compute_score which only recognises built-in data sources.
+            if "rm_scores" in data.batch.keys():
+                prompt_len = data.batch["prompts"].shape[-1]
+                resp_mask = data.batch["attention_mask"][i, prompt_len:].sum().item()
+                if resp_mask > 0:
+                    extras[i]["env_reward"] = float(data.batch["rm_scores"][i, resp_mask - 1].item())
             if "image_data" in data.non_tensor_batch:
                 extras[i]["image_data"] = data.non_tensor_batch["image_data"][i]
             if "rlcer_policy_rubric_raw" in data.non_tensor_batch:
@@ -83,6 +113,17 @@ class BatchRewardManager(AbstractRewardManager):
                 extras[i]["traj_idx"] = data.non_tensor_batch["traj_idx"][i]
             if "turn_idx" in data.non_tensor_batch:
                 extras[i]["turn_idx"] = data.non_tensor_batch["turn_idx"][i]
+            if "turn_env_states" in data.non_tensor_batch:
+                extras[i]["turn_env_states"] = data.non_tensor_batch["turn_env_states"][i]
+            if "initial_env_state" in data.non_tensor_batch:
+                extras[i]["initial_env_state"] = data.non_tensor_batch["initial_env_state"][i]
+            if "verifier_context" in data.non_tensor_batch:
+                extras[i]["verifier_context"] = data.non_tensor_batch["verifier_context"][i]
+            # Optional, behavior-neutral metadata used only by sparse RLCER
+            # mechanism auditing. It is injected by vagen/ray_trainer.py only
+            # when rubric_audit.enabled=true.
+            if "rlcer_global_step" in data.non_tensor_batch:
+                extras[i]["rlcer_global_step"] = data.non_tensor_batch["rlcer_global_step"][i]
 
         scores = self.compute_score(
             data_sources=data_sources,
@@ -95,8 +136,10 @@ class BatchRewardManager(AbstractRewardManager):
         return scores
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if "rm_scores" in data.batch.keys():
+        # If there is rm score and compute_score is the default one, we directly
+        # return rm score.  Custom reward functions (e.g. RLCER) are always invoked
+        # because they may combine outcome reward with additional signals.
+        if "rm_scores" in data.batch.keys() and not self._is_custom_reward_fn:
             if return_dict:
                 reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
                 reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
@@ -134,7 +177,7 @@ class BatchRewardManager(AbstractRewardManager):
             if already_printed.get(data_source, 0) < self.num_examine:
                 response_str = self.tokenizer.decode(data.batch["responses"][i][:length], skip_special_tokens=True)
                 prompt_str = self.tokenizer.decode(data.batch["prompts"][i], skip_special_tokens=True)
-                ground_truth = data[i].non_tensor_batch["reward_model"].get("ground_truth", None)
+                ground_truth = data[i].non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
                 print("[prompt]", prompt_str)
                 print("[response]", response_str)
                 print("[ground_truth]", ground_truth)
@@ -142,6 +185,14 @@ class BatchRewardManager(AbstractRewardManager):
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+
+        # Merge reward_extra_keys from agent loop (e.g. traj_success) into reward_extra_info
+        # so that custom reward functions don't lose these fields.
+        reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+        for key in reward_extra_keys:
+            if key not in reward_extra_info and key in data.non_tensor_batch:
+                values = data.non_tensor_batch[key]
+                reward_extra_info[key] = list(values) if hasattr(values, '__len__') else [values] * len(data)
 
         if return_dict:
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
