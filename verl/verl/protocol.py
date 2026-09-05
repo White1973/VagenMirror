@@ -938,7 +938,17 @@ class DataProto:
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+            try:
+                non_tensor_batch[key] = np.concatenate(val, axis=0)
+            except ValueError:
+                # Fallback for inhomogeneous shapes: concatenate as 1D object array
+                combined = np.empty(sum(len(v) for v in val), dtype=object)
+                offset = 0
+                for v in val:
+                    for i in range(len(v)):
+                        combined[offset + i] = v[i]
+                    offset += len(v)
+                non_tensor_batch[key] = combined
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
