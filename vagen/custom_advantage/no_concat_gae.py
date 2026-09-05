@@ -178,7 +178,8 @@ def compute_gae_no_concat_advantage_return(
         # ------------------------------------------------------------------
         # 4) Optional whitening (unique samples only)
         # ------------------------------------------------------------------
-        advantages_u = verl_F.masked_whiten(advantages_u, mask_f)
+        if kwargs.get("whiten", True):
+            advantages_u = verl_F.masked_whiten(advantages_u, mask_f)
 
         # ------------------------------------------------------------------
         # 5) Broadcast back to full batch (including padded duplicates)
@@ -326,7 +327,8 @@ def compute_gae_no_concat_advantage_return_firsttok(
         # ------------------------------------------------------------------
         # 4) Optional whitening (unique samples only)
         # ------------------------------------------------------------------
-        advantages_u = verl_F.masked_whiten(advantages_u, mask_f)
+        if kwargs.get("whiten", True):
+            advantages_u = verl_F.masked_whiten(advantages_u, mask_f)
 
         # ------------------------------------------------------------------
         # 5) Broadcast back to full batch (including padded duplicates)
