@@ -875,6 +875,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
+            # Reduce per-microbatch metric lists to scalars before cross-worker concat
+            for k, v in metrics.items():
+                if isinstance(v, list):
+                    metrics[k] = float(np.mean(v))
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -901,6 +905,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update_protected_multirole")
+    def update_actor_protected_multirole(self, data: DataProto):
+        """Run one protected optimizer step from isolated role gradients."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            with Timer(name="update_policy_protected_multirole", logger=None) as timer:
+                metrics = self.actor.update_policy_protected_multirole(data=data)
+            for key, value in metrics.items():
+                if isinstance(value, list):
+                    metrics[key] = float(np.mean(value))
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            self.actor_lr_scheduler.step()
+            output = DataProto(meta_info={"metrics": metrics}).to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
