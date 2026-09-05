@@ -126,7 +126,12 @@ class FrozenLake(GymImageEnv):
         self.total_reward = 0.0
         self.valid_actions = []
         obs = await self._render_async(init_obs=True)
-        info: Dict[str, Any] = {}
+        info: Dict[str, Any] = {
+            "initial_env_state": self._grounded_state(
+                action_is_valid=False,
+                action_is_effective=False,
+            )
+        }
         return obs, info
 
     async def system_prompt(self) -> Dict[str, Any]:
@@ -205,6 +210,11 @@ class FrozenLake(GymImageEnv):
 
         info["metrics"] = metrics
         info["success"] = metrics["traj_metrics"]["success"]
+        info["env_state"] = self._grounded_state(
+            action_is_valid=metrics["turn_metrics"]["action_is_valid"],
+            action_is_effective=metrics["turn_metrics"]["action_is_effective"],
+        )
+        info["env_state"]["valid_actions_executed"] = list(self.valid_actions)
         self.total_reward += reward
 
         obs = await self._render_async(init_obs=False)
@@ -229,6 +239,38 @@ class FrozenLake(GymImageEnv):
     def _get_player_position(self) -> Tuple[int, int]:
         """Get current player position as (row, col)."""
         return (self.gym_env.s // self.gym_env.ncol, self.gym_env.s % self.gym_env.ncol)
+
+    def _grounded_state(
+        self,
+        *,
+        action_is_valid: bool,
+        action_is_effective: bool,
+    ) -> Dict[str, Any]:
+        """Return compact, serializable state for FrozenLake rubric grounding."""
+        player_pos = self._get_player_position()
+        goal_positions = np.argwhere(self.gym_env.desc == b"G").tolist()
+        hole_positions = np.argwhere(self.gym_env.desc == b"H").tolist()
+        on_goal = bool(self.gym_env.desc[player_pos] == b"G")
+        in_hole = bool(self.gym_env.desc[player_pos] == b"H")
+        goal_distance = (
+            min(
+                abs(player_pos[0] - goal[0]) + abs(player_pos[1] - goal[1])
+                for goal in goal_positions
+            )
+            if goal_positions
+            else None
+        )
+        return {
+            "task_type": "frozenlake",
+            "player_pos": list(player_pos),
+            "goal_positions": goal_positions,
+            "hole_positions": hole_positions,
+            "goal_distance": goal_distance,
+            "reached_goal": on_goal,
+            "fell_in_hole": in_hole,
+            "action_is_valid": bool(action_is_valid),
+            "action_is_effective": bool(action_is_effective),
+        }
 
     def _apply_slip(self, action_int: int) -> int:
         """Apply custom slip probability to action.
