@@ -102,9 +102,17 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
     reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
 
     if not inspect.iscoroutinefunction(raw_fn):
-        return partial(_call_with_kwargs, raw_fn, reward_kwargs)
+        wrapped = partial(_call_with_kwargs, raw_fn, reward_kwargs)
     else:
-        return partial(_call_with_kwargs_async, raw_fn, reward_kwargs)
+        wrapped = partial(_call_with_kwargs_async, raw_fn, reward_kwargs)
+    # Mark as custom so BatchRewardManager / NaiveRewardManager can bypass
+    # the rm_scores short-circuit and always invoke this function.
+    wrapped._is_custom_reward_fn = True
+    for hook_name in ("get_tracker_state", "load_tracker_state"):
+        hook = getattr(raw_fn, hook_name, None)
+        if callable(hook):
+            setattr(wrapped, hook_name, hook)
+    return wrapped
 
 
 def load_reward_manager(
@@ -127,7 +135,8 @@ def load_reward_manager(
     # user defined reward manager can be registered in custom_reward_fn
     compute_score = get_custom_reward_fn(config)
     final_compute_score = compute_score
-
+    #print('reward config: ', config)
+    
     # The list of pre-defined reward managers are defined in `verl/workers/reward_manager/`:
     # naive: NaiveRewardManager
     # prime: PrimeRewardManager
@@ -138,6 +147,7 @@ def load_reward_manager(
     # By default reward_manager is set to naive (NaiveRewardManager)
     reward_manager_name = config.reward_model.get("reward_manager", "naive")
     reward_manager_cls = get_reward_manager_cls(reward_manager_name)
+    print('reward_manager_name:',reward_manager_name, reward_manager_cls)
 
     if compute_score is None:
         sandbox_config = config.reward_model.get("sandbox_fusion")
@@ -155,7 +165,7 @@ def load_reward_manager(
             )
         else:
             final_compute_score = default_compute_score
-
+    
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,
@@ -164,7 +174,6 @@ def load_reward_manager(
         reward_fn_key=config.data.reward_fn_key,
         **reward_kwargs,
     )
-
 
 @tqbridge(put_data=False)
 def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -178,6 +187,8 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
     """
     try:
         reward_result = reward_fn(data, return_dict=True)
+        # print('XXXX'*10,'reward_result', reward_fn)
+        # print('reward_result', reward_result.keys())
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
     except Exception as e:
