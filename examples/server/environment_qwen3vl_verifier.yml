@@ -1,0 +1,11 @@
+name: verify-qwen3vl
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # Resolves to the tested serving stack:
+      # torch 2.9.1+cu128, transformers 5.3.0,
+      # sglang-kernel 0.4.1, flashinfer-python 0.6.7.post3.
+      - sglang==0.5.10.post1
