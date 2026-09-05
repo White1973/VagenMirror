@@ -91,15 +91,62 @@ huggingface_hub:
 #   custom_reward_function.name=compute_score
 # ============================================================================
 custom_reward_function:
-  path: null
+  path: vagen/rlcer/reward_rlcer.py
   name: compute_score
   reward_kwargs:
     alpha: 0.2
-    lambda_cot: 1.0
+    lambda_cot: 0.0
+    rubricator_loss_weight: 0.001
+    rubricator_subsample_size: 0     # 0 = use actor PPO mini-batch size; set explicitly for isolated updates
+    rubricator_update_interval: 1    # auxiliary actor update every N trainer steps
     outcome_weight: 1.0
     enable_dual_role_update: false
+    dual_role_min_valid_ratio: 0.01
+    dual_role_strategy: post_advantage   # "shared_rho" (before-forward concat with shared ρ_t) or "post_advantage" (default, 0605 behavior)
+    # Rubricator update routing (only used when enable_dual_role_update=true and
+    # dual_role_strategy=shared_rho).
+    #   joint    (default, legacy): rubricator concatenated into reasoner batch.
+    #   isolate  (plan B): rubricator runs as an independent second update_actor
+    #             call; never shares a forward pass / batch-stat with reasoner.
+    #   protected: isolated role forward/backward passes at the same parameter
+    #              version, asymmetric PCGrad, one optimizer step.
+    rubricator_update_mode: joint
+    rubricator_grad_norm_ratio_cap: 0.02
+    # Cross-role behavior probes. These use small fixed prompt/response slices
+    # within a diagnostic step and do not alter either role's loss.
+    anchor_kl:
+      enabled: false
+      interval: 20
+      samples: 8
+    rubric_replay:
+      enabled: false
+      max_batches: 4
+      min_valid_ratio: 0.05
+      recovery_batch_size: 8
+      recovery_advantage: 1.0
+    pure_outcome: false
     policy_rubricator_use_actor_generation: true
+    policy_rubricator_max_new_tokens: 4096
     fallback_to_heuristic: true
+    # --- Feature flags (all default True for new behavior; set to False to revert) ---
+    normalize_rubric_weights: true    # Clamp + L1-normalize rubric weights to prevent inflation
+    ema_rule_corr_filter: true       # Use EMA batch-level correlation for n=1 rubric filtering
+    corr_ema_beta: 0.98              # Exponential decay for namespaced online correlation moments
+    corr_min_samples: 16             # Minimum observations before historical correlation is trusted
+    corr_calibration_interval: 10    # Absorb same-prompt n-way groups into the historical tracker every N steps
+    corr_schema_version: v1          # Bump when rule-family semantics change
+    insufficient_corr_policy: reject # reject rubrics when satisfaction/outcome correlation is not estimable
+    alignment_target: auto           # auto | traj_success | env_reward | visual_similarity | extra_info key
+    trivial_rubric_cooldown: true    # Soft-scale cot_reward when all-SAT/all-UNSAT
+    trivial_rubric_scale: 0.5        # Soft scale used when trivial_rubric_cooldown is enabled
+    alignment_rubricator_reward: true  # Align rubricator reward with outcome (anti-Nash)
+    rubric_validation_enabled: true  # False is an explicit unfiltered reward-shaping control
+    rubric_audit:
+      enabled: false                 # Structured per-rubric diagnostics; no effect on rewards
+      interval: 20                   # Audit step 1 and every N training steps
+      max_groups: 2                  # Bound JSONL volume while keeping complete groups
+      include_raw_proposal: true
+      max_raw_chars: 6000
     rubricator:
       # mode: policy | external | heuristic
       # policy mode: set endpoint/model to the same policy serving endpoint.
@@ -112,7 +159,34 @@ custom_reward_function:
     verifier:
       # mode: heuristic | external
       mode: heuristic
-      base_url: "http://127.0.0.1:8000/v1"
+      base_url: "http://localhost:5009/v1"
       api_key: "EMPTY"
-      model: ""
+      model: "qwen-verifier"
       timeout: 60
+    # --- Rubricator scheduler: anti-Nash / plateau detection / warmup ---
+    # All sub-mechanisms default to disabled for backward compatibility.
+    # Enable individually to activate dynamic rubricator control.
+    scheduler:
+      warmup_enabled: false           # Linearly ramp lambda_cot and rubricator_loss_weight from 0
+      warmup_steps: 100               # Number of steps for warmup
+      warmup_from_lambda_cot: 0.0     # Start value for lambda_cot warmup
+      warmup_from_rub_loss_weight: 0.0  # Start value for rubricator_loss_weight warmup
+      corr_gating_enabled: false      # Decay weights when rubric-outcome corr drops below threshold
+      corr_threshold: 0.15            # Correlation threshold for gating
+      corr_patience: 10               # Steps of low corr before decay
+      corr_weight_decay: 0.5          # Decay factor per patience window
+      anneal_min_lambda_cot: 0.0      # Minimum lambda_cot under decay
+      anneal_min_rub_loss_weight: 0.0  # Minimum rubricator_loss_weight under decay
+      plateau_enabled: false          # Freeze rubricator if validation stagnates
+      plateau_patience: 5             # Number of stagnant validations before freeze
+      plateau_rel_threshold: 0.05     # Relative change threshold
+      plateau_metric_key: val-core/sokoban/reward/mean@8
+      # Recoverable role-health guard. When enabled, malformed/empty rubric
+      # proposals suspend rubric RL without disabling rubric generation, then
+      # warm-restart updates after sustained healthy output.
+      recovery_enabled: false
+      recovery_enter_threshold: 0.80
+      recovery_exit_threshold: 0.95
+      recovery_enter_patience: 5
+      recovery_exit_patience: 20
+      recovery_warm_restart_steps: 50
