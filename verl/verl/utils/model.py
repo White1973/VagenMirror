@@ -629,14 +629,17 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         )
         return model
     except BaseException as e:
-        if not is_trl_available():
+        # Do not rely on the cached find_spec-based availability probe here.
+        # Ray workers can be created with a different import context while TRL
+        # is nevertheless importable from the active conda environment. Direct
+        # import both avoids that false negative and exposes the actual error.
+        try:
+            from trl import AutoModelForCausalLMWithValueHead
+        except (ImportError, ModuleNotFoundError) as trl_error:
             raise RuntimeError(
-                f"model({local_path}) is not a value head model, please install trl to make it valid"
-            ) from e
-
-    assert is_trl_available()
-
-    from trl import AutoModelForCausalLMWithValueHead
+                f"model({local_path}) is not a token-classification value-head model, "
+                "and TRL AutoModelForCausalLMWithValueHead could not be imported"
+            ) from trl_error
 
     if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
         module_class = AutoModelForVision2Seq
