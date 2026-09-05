@@ -157,6 +157,17 @@ class AgentData:
         self.env_rewards: List[float] = []
         self.traj_success: bool = False
         self.env_turns: int = 0
+        self.turn_env_states: List[dict] = []
+        self.initial_env_state: Optional[dict] = None
+        # Per-turn env-side quality metrics forwarded to reward_extra_info so
+        # they reach wandb (aux/<env>/<key>). SVG env writes dino_score /
+        # dreamsim_score into info each step; we keep the latest turn's value
+        # (final generated-image quality) to report for the whole trajectory.
+        self.last_dino_score: float = 0.0
+        self.last_dreamsim_score: float = 0.0
+        # Compact environment-grounded features used by task-specific
+        # verifiers. This is intentionally separate from the reward target.
+        self.verifier_context: Dict[str, Any] = {}
 
 
         # Cached assistant text to step env
@@ -273,6 +284,7 @@ class GymAgentLoop(AgentLoopBase):
 
         # Bootstrap: reset -> system_prompt (message order: system, then initial user)
         init_obs, info = await env.reset(seed=seed)
+        _initial_env_state = info.get("initial_env_state", None)
         sys_obs = await env.system_prompt()
 
         messages: List[Dict[str, Any]] = []
@@ -301,6 +313,7 @@ class GymAgentLoop(AgentLoopBase):
             response_limit=per_turn_response_limit,
             env_name=kwargs["env_name"],
         )
+        agent_data.initial_env_state = _initial_env_state
 
         # State machine: always GENERATE -> INTERACT, and decide termination inside INTERACT
         state = AgentState.PENDING
@@ -344,7 +357,17 @@ class GymAgentLoop(AgentLoopBase):
             reward_score=sum(agent_data.env_rewards) if agent_data.env_rewards else 0.0,
             num_turns=agent_data.env_turns,
             metrics=agent_data.metrics,
-            extra_fields={ "image_data": agent_data.image_data,"reward_extra_info": {"traj_success": float(agent_data.traj_success)}},
+            extra_fields={
+                "image_data": agent_data.image_data,
+                "reward_extra_info": {
+                    "traj_success": float(agent_data.traj_success),
+                    "dino_score": float(agent_data.last_dino_score),
+                    "dreamsim_score": float(agent_data.last_dreamsim_score),
+                    "turn_env_states": agent_data.turn_env_states,
+                    "initial_env_state": agent_data.initial_env_state,
+                    "verifier_context": agent_data.verifier_context,
+                },
+            },
         )
         return output
 
@@ -448,6 +471,20 @@ class GymAgentLoop(AgentLoopBase):
         agent_data.env_rewards.append(float(reward))
         agent_data.traj_success = extract_success(info)
         agent_data.env_turns += 1
+        if "env_state" in info:
+            agent_data.turn_env_states.append(info["env_state"])
+        # Forward env-side quality metrics (SVG dino_score / dreamsim_score).
+        # Missing/non-numeric -> keep previous value (0.0 default).
+        try:
+            agent_data.last_dino_score = float(info.get("dino_score", agent_data.last_dino_score))
+        except (TypeError, ValueError):
+            pass
+        try:
+            agent_data.last_dreamsim_score = float(info.get("dreamsim_score", agent_data.last_dreamsim_score))
+        except (TypeError, ValueError):
+            pass
+        if isinstance(info.get("verifier_context"), dict):
+            agent_data.verifier_context = dict(info["verifier_context"])
         # Termination rule #3: env done or success
         if done or agent_data.traj_success:
             return AgentState.TERMINATED
